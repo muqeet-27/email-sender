@@ -9,6 +9,8 @@ import os
 import re
 from typing import List, Optional
 from dotenv import load_dotenv
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure
 
 # Load environment variables from .env file
 load_dotenv()
@@ -16,14 +18,35 @@ load_dotenv()
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT_SSL = 465
 
-# Load Gmail credentials from environment variables
+# Load Gmail and MongoDB credentials from environment variables
 try:
     GMAIL_USER = os.getenv("GMAIL_EMAIL")
     GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
-    if not GMAIL_USER or not GMAIL_APP_PASSWORD:
-        raise ValueError("Gmail credentials not found in .env file.")
-except ValueError as e:
-    st.error(str(e))
+    MONGODB_USERNAME = os.getenv("MONGODB_USERNAME")
+    MONGODB_PASSWORD = os.getenv("MONGODB_PASSWORD")
+    if not GMAIL_USER:
+        st.error("GMAIL_EMAIL not found in .env file.")
+        st.stop()
+    if not GMAIL_APP_PASSWORD:
+        st.error("GMAIL_APP_PASSWORD not found in .env file.")
+        st.stop()
+    if not MONGODB_USERNAME or not MONGODB_PASSWORD:
+        st.error("MongoDB credentials (MONGODB_USERNAME or MONGODB_PASSWORD) not found in .env file.")
+        st.stop()
+except Exception as e:
+    st.error(f"Error loading .env file: {str(e)}")
+    st.stop()
+
+# Initialize MongoDB client
+try:
+    MONGODB_URI = f"mongodb+srv://{MONGODB_USERNAME}:{MONGODB_PASSWORD}@cluster0.rw40wkt.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+    client = MongoClient(MONGODB_URI)
+    db = client["email_app"]
+    defaults_collection = db["defaults"]
+    # Test connection
+    client.admin.command("ping")
+except ConnectionFailure:
+    st.error("Failed to connect to MongoDB. Please check your credentials or network.")
     st.stop()
 
 st.set_page_config(page_title="Gmail Sender", page_icon="📧", layout="centered")
@@ -34,10 +57,33 @@ for key, default in [
     ("default_subject", ""),
     ("default_body", ""),
     ("default_files", []),
+    ("default_file_metadata", []),  # Store metadata (filename, size)
     ("tmp_paths", [])
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
+
+# Load defaults from MongoDB (single document for simplicity)
+def load_defaults_from_mongo():
+    try:
+        defaults = defaults_collection.find_one({"user": GMAIL_USER})
+        if defaults:
+            st.session_state.default_subject = defaults.get("subject", "")
+            st.session_state.default_body = defaults.get("body", "")
+            st.session_state.default_file_metadata = defaults.get("file_metadata", [])
+        else:
+            # Initialize empty defaults in MongoDB
+            defaults_collection.insert_one({
+                "user": GMAIL_USER,
+                "subject": "",
+                "body": "",
+                "file_metadata": []
+            })
+    except Exception as e:
+        st.error(f"Error loading defaults from MongoDB: {str(e)}")
+
+# Load defaults on app start
+load_defaults_from_mongo()
 
 # Email validation
 def is_valid_email(email: str) -> bool:
@@ -103,10 +149,35 @@ with st.form("set_defaults"):
     save_defaults = st.form_submit_button("Save defaults")
 
 if save_defaults:
+    # Save to session state
     st.session_state.default_subject = d_subject
     st.session_state.default_body = d_body
     st.session_state.default_files = d_files or []
-    st.success("Default content saved.")
+    
+    # Save file metadata (not the files themselves)
+    file_metadata = [{"name": f.name, "size": f.size} for f in (d_files or [])]
+    st.session_state.default_file_metadata = file_metadata
+    
+    # Save to MongoDB
+    try:
+        defaults_collection.update_one(
+            {"user": GMAIL_USER},
+            {"$set": {
+                "subject": d_subject,
+                "body": d_body,
+                "file_metadata": file_metadata
+            }},
+            upsert=True
+        )
+        st.success("Default content saved to MongoDB.")
+    except Exception as e:
+        st.error(f"Error saving defaults to MongoDB: {str(e)}")
+
+# Display saved attachment metadata
+if st.session_state.default_file_metadata:
+    st.markdown("**Saved default attachments**:")
+    for meta in st.session_state.default_file_metadata:
+        st.write(f"- {meta['name']} ({meta['size'] / 1024:.2f} KB)")
 
 st.divider()
 st.markdown("### Step 2 — Send email")
